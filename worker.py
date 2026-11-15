@@ -1,6 +1,4 @@
-import base64
 import hashlib
-import io
 import math
 import os
 import re
@@ -47,6 +45,7 @@ from qdrant_client.models import (
     FilterSelector,
     MatchValue,
     MatchAny,
+    PayloadSchemaType,
     PointStruct,
     QueryRequest,
     SparseVector,
@@ -60,12 +59,19 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # (единственный источник истины по типам exact/paraphrase/semantic).
 from ai_result import build_ai_fragments, resolve_ai_percent
 from ai_scoring import format_startup_line, load_ai_config, score_stats
-from text_normalize import normalize_text
+from text_normalize import extract_text, normalize_text
 from comparison_scope import comparison_categories, normalize_category_slug
 from cascade import (
     DEFAULT_PARAPHRASE_THRESHOLD,
+    DEFAULT_STRONG_SOURCE_MIN_CHUNKS,
+    DEFAULT_TEMPLATE_MIN_SOURCES,
+    NEAR_VERBATIM_COVERAGE,
+    NEAR_VERBATIM_DENSE,
+    NEAR_VERBATIM_LEXICAL,
     STOPWORDS as _STOPWORDS,
     append_fragment,
+    bigram_coverage,
+    classify_chunks,
     classify_match,
     make_fragment,
     paraphrase_similarity,
@@ -136,6 +142,32 @@ class AntiPlagiarismWorker:
             os.getenv("PARAPHRASE_THRESHOLD", str(DEFAULT_PARAPHRASE_THRESHOLD))
         )
 
+        # Шаблонные фразы (cascade.classify_chunks): кусок, похожий на куски из
+        # TEMPLATE_MIN_SOURCES и более разных работ, не считается заимствованием,
+        # если ни одна из них не совпадает с работой хотя бы по
+        # STRONG_SOURCE_MIN_CHUNKS кускам. TEMPLATE_MIN_SOURCES=0 — выключить.
+        self.template_min_sources = int(
+            os.getenv("TEMPLATE_MIN_SOURCES", str(DEFAULT_TEMPLATE_MIN_SOURCES))
+        )
+        self.strong_source_min_chunks = _parse_positive_int(
+            "STRONG_SOURCE_MIN_CHUNKS", DEFAULT_STRONG_SOURCE_MIN_CHUNKS
+        )
+        # Покрытие пар слов (cascade.bigram_coverage): ловит дословную копию,
+        # которая из-за другого деления на абзацы легла на стык кусков источника.
+        # COVERAGE_THRESHOLD — доля пар слов куска, найденных в кусках одного
+        # источника; COVERAGE_CANDIDATE_THRESHOLD — с какого лексического
+        # сходства кусок источника берётся в кандидаты для покрытия.
+        self.coverage_threshold = float(os.getenv("COVERAGE_THRESHOLD", "0.6"))
+        self.coverage_candidate_threshold = float(
+            os.getenv("COVERAGE_CANDIDATE_THRESHOLD", "0.3")
+        )
+        self.coverage_max_neighbours = _parse_positive_int("COVERAGE_MAX_NEIGHBOURS", 6)
+        # Сколько кандидатов брать на кусок: нужно, чтобы посчитать, у скольких
+        # разных работ есть такая фраза. Не меньше порога шаблона.
+        self.match_candidates = max(
+            _parse_positive_int("MATCH_CANDIDATES", 20), self.template_min_sources, 1
+        )
+
         # Детектор ИИ — Fast-DetectGPT. Все пороги, окно и агрегация — из env
         # (ai_scoring.load_ai_config). Поиск заимствований ниже остаётся на 500/50.
         self.ai_config = load_ai_config()
@@ -175,8 +207,14 @@ class AntiPlagiarismWorker:
             self.ai_model = AutoModelForCausalLM.from_pretrained(model_name).to(self.device)
             self.ai_model.eval()
 
+        # Ключ Qdrant (QDRANT__SERVICE__API_KEY на стороне базы). Пусто — без ключа,
+        # для локального запуска без Docker.
+        qdrant_api_key = os.getenv("QDRANT_API_KEY", "").strip() or None
         self.qdrant = QdrantClient(
-            url=f"http://{qdrant_host}:{qdrant_port}", prefer_grpc=False, timeout=30.0
+            url=f"http://{qdrant_host}:{qdrant_port}",
+            api_key=qdrant_api_key,
+            prefer_grpc=False,
+            timeout=30.0,
         )
         self.collection_name = collection_name
         self._ensure_qdrant_collection()
@@ -212,6 +250,7 @@ class AntiPlagiarismWorker:
                     sparse_cfg = info.config.params.sparse_vectors or {}
                     has_lexical = self.LEXICAL_VECTOR in sparse_cfg
                     if current_size == vector_size and has_lexical:
+                        self._ensure_payload_indexes()
                         return
                     print(
                         f"Qdrant collection schema mismatch "
@@ -229,6 +268,7 @@ class AntiPlagiarismWorker:
                     },
                     sparse_vectors_config={self.LEXICAL_VECTOR: SparseVectorParams()},
                 )
+                self._ensure_payload_indexes()
                 return
             except Exception as e:  # includes connection errors / Qdrant not ready yet
                 last_err = e
@@ -237,36 +277,33 @@ class AntiPlagiarismWorker:
         if last_err:
             raise RuntimeError(f"Qdrant is not ready: {last_err}") from last_err
 
-    def extract_real_text(self, text_input: str) -> str:
-        if not isinstance(text_input, str) or not text_input.startswith("FILE_BASE64|"):
-            return text_input
-        try:
-            parts = text_input.split("|", 2)
-            if len(parts) != 3:
-                return text_input
-            _, ext, b64_data = parts
-            file_bytes = base64.b64decode(b64_data)
-            file_stream = io.BytesIO(file_bytes)
-            if ext.lower() == "pdf":
-                from pypdf import PdfReader
+    # Поля payload, по которым фильтруется каждый поиск и удаление
+    # (_build_comparison_filter, delete). Без индексов Qdrant перебирает
+    # все точки коллекции — с ростом базы поиск замедляется.
+    PAYLOAD_INDEXES = {
+        "institution_id": PayloadSchemaType.KEYWORD,
+        "category": PayloadSchemaType.KEYWORD,
+        "user_id": PayloadSchemaType.KEYWORD,
+        "filename": PayloadSchemaType.KEYWORD,
+        "document_id": PayloadSchemaType.INTEGER,
+    }
 
-                reader = PdfReader(file_stream)
-                extracted = "\n".join(
-                    [page.extract_text() or "" for page in reader.pages]
+    def _ensure_payload_indexes(self) -> None:
+        """Создаёт индексы payload; повторный вызов для существующего индекса безопасен."""
+        for field, schema in self.PAYLOAD_INDEXES.items():
+            try:
+                self.qdrant.create_payload_index(
+                    collection_name=self.collection_name,
+                    field_name=field,
+                    field_schema=schema,
+                    wait=True,
                 )
-                return extracted.strip()
-            elif ext.lower() in ["docx", "doc"]:
-                import docx
+            except Exception as exc:  # noqa: BLE001 — без индекса поиск работает, только медленнее
+                print(f"Qdrant payload index {field!r} not created: {exc}")
 
-                doc = docx.Document(file_stream)
-                extracted = "\n".join([p.text for p in doc.paragraphs])
-                return extracted.strip()
-        except Exception as e:
-            # Пробрасываем ошибку (api_server отдаст 400): раньше здесь
-            # возвращалась строка-заглушка, которая индексировалась как текст
-            # документа — и все последующие битые файлы «совпадали» с ней на 100%.
-            raise ValueError(f"Не удалось извлечь текст из файла: {e}") from e
-        return text_input
+    def extract_real_text(self, text_input: str) -> str:
+        # Вся логика и сообщения об ошибках — в text_normalize.extract_text (покрыто тестами).
+        return extract_text(text_input)
 
     def _lexical_sparse(self, text: str) -> Optional[SparseVector]:
         """
@@ -491,6 +528,7 @@ class AntiPlagiarismWorker:
         if not chunks:
             return {
                 "plagiarism_percent": 0.0,
+                "template_percent": 0.0,
                 "ai_percent": None,
                 "ai_fragments": [],
                 "parsed_text": actual_text,
@@ -552,7 +590,7 @@ class AntiPlagiarismWorker:
                 QueryRequest(
                     query=vec,
                     using=self.DENSE_VECTOR,
-                    limit=1,
+                    limit=self.match_candidates,
                     score_threshold=self.qdrant_score_threshold,
                     with_payload=True,
                     filter=search_filter,
@@ -565,8 +603,13 @@ class AntiPlagiarismWorker:
                     QueryRequest(
                         query=sparse,
                         using=self.LEXICAL_VECTOR,
-                        limit=1,
-                        score_threshold=self.lexical_score_threshold,
+                        limit=self.match_candidates,
+                        # Кандидаты с запасом: куски ниже LEXICAL_SCORE_THRESHOLD
+                        # сами по себе не засчитываются, но нужны для покрытия
+                        # (сдвинутый кусок собирается из соседних кусков источника).
+                        score_threshold=min(
+                            self.lexical_score_threshold, self.coverage_candidate_threshold
+                        ),
                         with_payload=True,
                         filter=search_filter,
                     )
@@ -585,11 +628,30 @@ class AntiPlagiarismWorker:
                 )
             else:
                 raise
-        # Топ-совпадение каждого чанка по каждому сигналу.
-        chunk_hits: List[Dict[str, object]] = [{} for _ in chunks]
+        # Кандидаты каждого чанка по каждому сигналу (по убыванию сходства).
+        chunk_hits: List[Dict[str, list]] = [{} for _ in chunks]
         for (chunk_idx, kind), qdrant_res in zip(request_map, batch_search_results):
             if len(qdrant_res.points) > 0:
-                chunk_hits[chunk_idx][kind] = qdrant_res.points[0]
+                chunk_hits[chunk_idx][kind] = list(qdrant_res.points)
+        # Доказательства по каждому куску: какие работы-источники и чем
+        # подтверждены (dense ≥ порога, lexical ≥ порога, покрытие пар слов).
+        chunk_evidence = [
+            self._chunk_evidence(chunk_text, hits)
+            for chunk_text, hits in zip(chunks, chunk_hits)
+        ]
+        # Шаблонные фразы (общие для многих работ) отделяются от заимствований,
+        # см. cascade.classify_chunks.
+        chunk_sources = [set(ev) for ev in chunk_evidence]
+        chunk_verbatim_sources = [
+            {src for src, e in ev.items() if e["verbatim"]} for ev in chunk_evidence
+        ]
+        template_flags, strong_sources = classify_chunks(
+            chunk_sources,
+            self.template_min_sources,
+            self.strong_source_min_chunks,
+            chunk_verbatim_sources,
+        )
+        template_chunks = 0
         plagiarized_chunks = 0
         points_to_insert = []
         # Аггрегация совпадений по работам-источникам: dense ловит глубокий рерайт
@@ -599,23 +661,21 @@ class AntiPlagiarismWorker:
         for chunk_idx, (chunk_text, vector, sparse) in enumerate(
             zip(chunks, vectors, sparse_vectors)
         ):
-            hits = chunk_hits[chunk_idx]
-            if hits:
+            evidence = chunk_evidence[chunk_idx]
+            if template_flags[chunk_idx]:
+                template_chunks += 1
+                evidence = {}  # шаблон: не засчитывается и не атрибутируется источнику
+            elif evidence:
                 plagiarized_chunks += 1
-            counted_sources = set()
-            for kind, score_field in (
-                ("semantic", "max_score"),
-                ("lexical", "max_lexical_score"),
-            ):
-                top = hits.get(kind)
-                if top is None:
-                    continue
-                payload = top.payload or {}
-                src_key = str(
-                    payload.get("document_id")
-                    if payload.get("document_id") is not None
-                    else payload.get("filename") or "unknown"
+            if evidence:
+                # Кусок атрибутируется одной работе: сильному источнику, если он
+                # есть среди подтверждённых, иначе самому похожему.
+                src_key = max(
+                    evidence,
+                    key=lambda s: (s in strong_sources, evidence[s]["strength"]),
                 )
+                e = evidence[src_key]
+                payload = e["point"].payload or {}
                 agg = matches_by_source.setdefault(
                     src_key,
                     {
@@ -629,23 +689,23 @@ class AntiPlagiarismWorker:
                         "fragments": [],
                     },
                 )
-                if src_key not in counted_sources:
-                    agg["matched_chunks"] += 1
-                    counted_sources.add(src_key)
-                score = float(top.score or 0.0)
+                agg["matched_chunks"] += 1
                 matched_text = payload.get("text")
                 source_text = matched_text if isinstance(matched_text, str) else ""
-                if score > agg[score_field]:
-                    agg[score_field] = round(score, 4)
-                    if kind == "semantic" or not agg["sample"]:
+                if e["dense"] > agg["max_score"]:
+                    agg["max_score"] = round(e["dense"], 4)
+                    agg["sample"] = chunk_text[:300]
+                if e["lexical"] > agg["max_lexical_score"]:
+                    agg["max_lexical_score"] = round(e["lexical"], 4)
+                    if not agg["sample"]:
                         agg["sample"] = chunk_text[:300]
                 append_fragment(
                     agg["fragments"],
                     make_fragment(
                         chunk_text,
                         source_text,
-                        score,
-                        kind,
+                        e["strength"],
+                        "lexical" if e["lexical"] >= self.lexical_score_threshold else "semantic",
                         self.lexical_score_threshold,
                         self.paraphrase_threshold,
                     ),
@@ -689,6 +749,7 @@ class AntiPlagiarismWorker:
                 collection_name=self.collection_name, points=points_to_insert
             )
         plagiarism_percent = round((plagiarized_chunks / len(chunks)) * 100, 2)
+        template_percent = round((template_chunks / len(chunks)) * 100, 2)
         semantic_matches: List[dict] = sorted(
             matches_by_source.values(),
             key=lambda m: (m["matched_chunks"], max(m["max_score"], m["max_lexical_score"])),
@@ -707,12 +768,71 @@ class AntiPlagiarismWorker:
             by_type[match["match_type"]] += 1
         return {
             "plagiarism_percent": plagiarism_percent,
+            "template_percent": template_percent,
             "ai_percent": ai_percent,
             "ai_fragments": ai_fragments,
             "parsed_text": actual_text,
             "semantic_matches": semantic_matches,
             "by_type": by_type,
         }
+
+    def _chunk_evidence(self, chunk_text: str, hits: Dict[str, list]) -> Dict[str, dict]:
+        """
+        Работы-источники, совпадение с которыми у куска подтверждено, и сила
+        совпадения. Источник подтверждён, если:
+        - dense-сходство ≥ QDRANT_SCORE_THRESHOLD (смысл, рерайт), или
+        - lexical-сходство ≥ LEXICAL_SCORE_THRESHOLD (дословно), или
+        - пары слов куска покрыты кусками этого источника на ≥ COVERAGE_THRESHOLD
+          (дословная копия, сдвинутая относительно кусков источника).
+        """
+        by_source: Dict[str, Dict[str, list]] = {}
+        for kind, points in hits.items():
+            for p in points:
+                by_source.setdefault(self._source_key(p), {}).setdefault(kind, []).append(p)
+        evidence: Dict[str, dict] = {}
+        for src, kinds in by_source.items():
+            dense_pts = kinds.get("semantic", [])
+            lex_pts = kinds.get("lexical", [])
+            dense = max((float(p.score or 0) for p in dense_pts), default=0.0)
+            lexical = max((float(p.score or 0) for p in lex_pts), default=0.0)
+            texts = [
+                (p.payload or {}).get("text") or ""
+                for p in (lex_pts + dense_pts)[: self.coverage_max_neighbours]
+            ]
+            coverage = bigram_coverage(chunk_text, texts)
+            confirmed = (
+                dense >= self.qdrant_score_threshold
+                or lexical >= self.lexical_score_threshold
+                or coverage >= self.coverage_threshold
+            )
+            if not confirmed:
+                continue
+            lexical_signal = max(
+                lexical if lexical >= self.lexical_score_threshold else 0.0,
+                coverage if coverage >= self.coverage_threshold else 0.0,
+            )
+            dense_signal = dense if dense >= self.qdrant_score_threshold else 0.0
+            best_point = max(dense_pts + lex_pts, key=lambda p: float(p.score or 0))
+            evidence[src] = {
+                "point": best_point,
+                "dense": dense_signal,
+                "lexical": lexical_signal,
+                "strength": max(dense_signal, lexical_signal),
+                "verbatim": lexical >= NEAR_VERBATIM_LEXICAL
+                or dense >= NEAR_VERBATIM_DENSE
+                or coverage >= NEAR_VERBATIM_COVERAGE,
+            }
+        return evidence
+
+    @staticmethod
+    def _source_key(point) -> str:
+        """Ключ работы-источника для найденной точки Qdrant."""
+        payload = point.payload or {}
+        return str(
+            payload.get("document_id")
+            if payload.get("document_id") is not None
+            else payload.get("filename") or "unknown"
+        )
 
     def delete_document_points(self, document_id: int) -> None:
         """Удаляет чанки документа из Qdrant. Нет точек — тоже успех."""
