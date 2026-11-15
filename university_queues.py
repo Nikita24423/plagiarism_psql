@@ -17,7 +17,7 @@ import asyncio
 import logging
 import time
 from collections import deque
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +53,7 @@ class UniversityQueues:
         # Future ошибкой, иначе ожидающие запросы зависнут и заблокируют shutdown.
         for queue in self._queues.values():
             while queue:
-                _fn, future, _enqueued = queue.popleft()
+                _fn, future, _enqueued, _on_start = queue.popleft()
                 if not future.done():
                     future.set_exception(
                         RuntimeError("Analysis service is shutting down; retry the request")
@@ -61,8 +61,18 @@ class UniversityQueues:
 
     # --- постановка задач ---
 
-    def submit(self, university: str, fn: Callable[[], Any]) -> "asyncio.Future[Any]":
-        """Ставит задачу в очередь университета и возвращает Future с результатом."""
+    def submit(
+        self,
+        university: str,
+        fn: Callable[[], Any],
+        on_start: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> "asyncio.Future[Any]":
+        """Ставит задачу в очередь университета и возвращает Future с результатом.
+
+        on_start — корутина, которая вызывается в момент, когда планировщик
+        реально берёт задачу в работу (например, перевести статус задачи из
+        queued в processing). Пока задача стоит в очереди, она не вызывается.
+        """
         university = (university or DEFAULT_UNIVERSITY).strip() or DEFAULT_UNIVERSITY
         loop = asyncio.get_running_loop()
         future: "asyncio.Future[Any]" = loop.create_future()
@@ -80,7 +90,7 @@ class UniversityQueues:
                 len(self._queues),
             )
 
-        queue.append((fn, future, time.monotonic()))
+        queue.append((fn, future, time.monotonic(), on_start))
         self._wake.set()
         return future
 
@@ -114,15 +124,26 @@ class UniversityQueues:
             except BaseException:
                 self._sem.release()
                 raise
-            university, (fn, future, _enqueued) = job
+            university, (fn, future, _enqueued, on_start) = job
             if future.cancelled():
                 self._sem.release()
                 continue
             self._active[university] += 1
-            asyncio.create_task(self._run_job(university, fn, future))
+            asyncio.create_task(self._run_job(university, fn, future, on_start))
 
-    async def _run_job(self, university: str, fn: Callable[[], Any], future) -> None:
+    async def _run_job(
+        self,
+        university: str,
+        fn: Callable[[], Any],
+        future,
+        on_start: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> None:
         try:
+            if on_start is not None:
+                try:
+                    await on_start()
+                except Exception:  # noqa: BLE001 — сбой статуса не должен ронять анализ
+                    logger.exception("on_start callback failed")
             result = await asyncio.to_thread(fn)
             if not future.done():
                 future.set_result(result)

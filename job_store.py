@@ -114,9 +114,11 @@ async def run_queued_job(
 ) -> None:
     """
     submit() must return an awaitable Future from UniversityQueues.submit(...).
+
+    Статус processing ставит сама очередь (on_start в UniversityQueues.submit),
+    когда задача реально начинает выполняться; до этого задача остаётся queued.
     """
     store = get_job_store()
-    await store.mark_processing(job_id)
     try:
         future = submit()
         result = await future

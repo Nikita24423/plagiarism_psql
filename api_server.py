@@ -68,6 +68,9 @@ class AiFragment(BaseModel):
 
 class AnalyzeResponse(BaseModel):
     plagiarism_percent: float
+    # Доля кусков с шаблонными фразами (общими для многих работ): показываются
+    # отдельно и не входят в plagiarism_percent. См. cascade.classify_chunks.
+    template_percent: float = 0.0
     ai_percent: Optional[float] = None
     ai_fragments: list[AiFragment] = []
     semantic_matches: list[SemanticMatch] = []
@@ -111,6 +114,7 @@ def _to_analyze_response(result: dict[str, Any]) -> AnalyzeResponse:
     raw_ai = result.get("ai_percent")
     return AnalyzeResponse(
         plagiarism_percent=float(result.get("plagiarism_percent", 0.0)),
+        template_percent=float(result.get("template_percent", 0.0)),
         ai_percent=None if raw_ai is None else float(raw_ai),
         ai_fragments=[AiFragment(**f) for f in result.get("ai_fragments", [])],
         semantic_matches=[SemanticMatch(**m) for m in result.get("semantic_matches", [])],
@@ -238,6 +242,7 @@ async def submit_job(body: AnalyzeRequest, x_api_key: Optional[str] = Header(def
                 user_id=user_id,
                 exclude_document_ids=exclude_document_ids,
             ),
+            on_start=lambda: store.mark_processing(job_id),
         )
 
     asyncio.create_task(run_queued_job(job_id, _submit))
