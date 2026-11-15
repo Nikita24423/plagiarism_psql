@@ -1,8 +1,19 @@
 """Fast-DetectGPT scoring knobs. No PyTorch — safe to unit-test.
 
-Defaults match the previous hardcoded behaviour:
-window 500/50, skip chunks of 100 characters or shorter, 1024 tokens,
-mean of D, then a sigmoid with d0=1.0 and scale=1.5.
+Defaults match docker-compose.yml, so the service scores the same whether it
+runs in Docker or locally: window 1000/100, skip chunks of 100 characters or
+shorter, 1500 tokens, mean of D, then a sigmoid with d0=0.0 and scale=1.0.
+
+Calibration (2026-11-14, without a labelled set): the previous d0=-2.2/scale=3
+put the 50% mark at the very bottom of the observed D range (-2.6 … +0.6), so
+almost any coherent text scored 75–100%. Requirement: ordinary student works
+average 10–30%, 60–100% must be rare. d0 near 0 is the point where a text is as
+predictable for the scoring model as the model's own samples (E[D] = 0 for
+model-generated text). On the 98 BSUIR test documents (folder «ЛЧ», built from
+two real diploma works) d0=0.0/scale=1 gives: mean 27%, median 26%, max 41%,
+none above 60%; diploma A ~19%, diploma B ~35–44%. Authorship of the diplomas
+is unknown, so this is the smallest shift that meets the requirement.
+Re-check on works of known authorship (human-written vs AI-generated) when available.
 """
 
 from __future__ import annotations
@@ -10,6 +21,12 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass
+
+DEFAULT_D0 = 0.0
+DEFAULT_SCALE = 1.0
+DEFAULT_CHUNK_SIZE = 1000
+DEFAULT_CHUNK_OVERLAP = 100
+DEFAULT_MAX_TOKENS = 1500
 
 AGGREGATIONS = ("mean", "median", "max", "top_share")
 
@@ -78,16 +95,16 @@ class AiConfig:
 
 
 def load_ai_config() -> AiConfig:
-    d0 = _env_float("AI_DETECT_D0", 1.0)
-    scale = _env_float("AI_DETECT_SCALE", 1.5)
-    chunk_size = _env_positive_int("AI_CHUNK_SIZE", 500)
+    d0 = _env_float("AI_DETECT_D0", DEFAULT_D0)
+    scale = _env_float("AI_DETECT_SCALE", DEFAULT_SCALE)
+    chunk_size = _env_positive_int("AI_CHUNK_SIZE", DEFAULT_CHUNK_SIZE)
     overlap_raw = os.getenv("AI_CHUNK_OVERLAP")
     if overlap_raw is None or overlap_raw.strip() == "":
-        chunk_overlap = 50
+        chunk_overlap = DEFAULT_CHUNK_OVERLAP
     elif overlap_raw.strip() == "0":
         chunk_overlap = 0
     else:
-        chunk_overlap = _env_positive_int("AI_CHUNK_OVERLAP", 50)
+        chunk_overlap = _env_positive_int("AI_CHUNK_OVERLAP", DEFAULT_CHUNK_OVERLAP)
     if chunk_overlap >= chunk_size:
         fallback = max(0, chunk_size // 5)
         _warn(f"AI_CHUNK_OVERLAP={chunk_overlap} must be < AI_CHUNK_SIZE={chunk_size}, using {fallback}")
@@ -117,7 +134,7 @@ def load_ai_config() -> AiConfig:
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         min_chunk_chars=_env_positive_int("AI_MIN_CHUNK_CHARS", 100),
-        max_tokens=_env_positive_int("AI_MAX_TOKENS", 1024),
+        max_tokens=_env_positive_int("AI_MAX_TOKENS", DEFAULT_MAX_TOKENS),
         aggregation=aggregation,
         top_share_threshold=top_share_threshold,
         d0=d0,
