@@ -2,18 +2,20 @@
 
 Defaults match docker-compose.yml, so the service scores the same whether it
 runs in Docker or locally: window 1000/100, skip chunks of 100 characters or
-shorter, 1500 tokens, mean of D, then a sigmoid with d0=0.0 and scale=1.0.
+shorter, 1500 tokens, mean of D, then a sigmoid with d0=0.8 and scale=1.0.
 
-Calibration (2026-11-14, without a labelled set): the previous d0=-2.2/scale=3
-put the 50% mark at the very bottom of the observed D range (-2.6 … +0.6), so
-almost any coherent text scored 75–100%. Requirement: ordinary student works
-average 10–30%, 60–100% must be rare. d0 near 0 is the point where a text is as
-predictable for the scoring model as the model's own samples (E[D] = 0 for
-model-generated text). On the 98 BSUIR test documents (folder «ЛЧ», built from
-two real diploma works) d0=0.0/scale=1 gives: mean 27%, median 26%, max 41%,
-none above 60%; diploma A ~19%, diploma B ~35–44%. Authorship of the diplomas
-is unknown, so this is the smallest shift that meets the requirement.
-Re-check on works of known authorship (human-written vs AI-generated) when available.
+Calibration (2026-11-15). Requirement: ordinary student works average 10–30%,
+60–100% must be rare. The previous d0=-2.2/scale=3 scored almost any coherent
+text 75–100%. Calibrated on two works of known human authorship written before
+ChatGPT (Nov 2022) — the reference diplomas of the BSUIR test package «ЛЧ»:
+diploma A (2020) mean D = -1.48, master's thesis B (spring 2022) mean D = -0.24.
+d0=0.8/scale=1 gives them 9% and 26%; on the 98 test documents built from them:
+mean 15%, median 13%, max 24%, none above 30%.
+Filtering windows (code, English text, repeated diagram labels) changed D by
+less than 0.03 — the high D of thesis B comes from fluent standard prose.
+Limitation: rugpt3small separates modern AI text poorly (AI-written samples had
+D -1.7 … -0.9), so the AI score mostly avoids false alarms rather than proving
+AI use. Re-check on more works of known authorship when available.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ import math
 import os
 from dataclasses import dataclass
 
-DEFAULT_D0 = 0.0
+DEFAULT_D0 = 0.8
 DEFAULT_SCALE = 1.0
 DEFAULT_CHUNK_SIZE = 1000
 DEFAULT_CHUNK_OVERLAP = 100
